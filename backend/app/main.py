@@ -3,14 +3,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import psycopg
 import requests
-from bs4 import BeautifulSoup
-import aiohttp
-import asyncio
 from pydantic import BaseModel, HttpUrl
 import io
 import csv
 from typing import List, Dict, Optional, Any
 import re
+import sys
+import subprocess
+import json
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).parent.parent))
 
 app = FastAPI(title="Link Checker for Journalists")
 
@@ -36,88 +39,93 @@ class LinkResult(BaseModel):
 async def healthz():
     return {"status": "ok"}
 
-def extract_links(url: str, html_content: str) -> List[str]:
-    """Extract all links from the HTML content."""
-    soup = BeautifulSoup(html_content, 'html.parser')
-    base_url = url
-    
-    base_tag = soup.find('base')
-    if base_tag and base_tag.get('href'):
-        base_url = base_tag['href']
-    
-    links = []
-    for a_tag in soup.find_all('a', href=True):
-        href = a_tag['href']
-        if href.startswith('#'):
-            continue
-            
-        if not href.startswith(('http://', 'https://')):
-            if href.startswith('/'):
-                parsed_url = requests.utils.urlparse(base_url)
-                href = f"{parsed_url.scheme}://{parsed_url.netloc}{href}"
-            else:
-                if not base_url.endswith('/'):
-                    base_url = base_url + '/'
-                href = requests.compat.urljoin(base_url, href)
-        
-        links.append(href)
-    
-    unique_links = []
-    for link in links:
-        if link not in unique_links:
-            unique_links.append(link)
-    
-    return unique_links
-
-async def check_link(session: aiohttp.ClientSession, link: str) -> LinkResult:
-    """Check if a link is broken."""
+def run_broken_link_checker(url: str) -> List[LinkResult]:
+    """Use broken-link-checker to check all links on a webpage."""
     try:
-        async with session.get(link, timeout=10, allow_redirects=True) as response:
-            return LinkResult(
-                url=link,
-                status=response.status,
-                error=None,
-                is_broken=response.status >= 400
-            )
-    except asyncio.TimeoutError:
-        return LinkResult(
-            url=link,
-            status=None,
-            error="Timeout",
-            is_broken=True
-        )
-    except aiohttp.ClientError as e:
-        return LinkResult(
-            url=link,
-            status=None,
-            error=str(e),
-            is_broken=True
-        )
+        temp_file = Path(__file__).parent.parent / "link_results.json"
+        
+        cmd = [
+            "node", 
+            "-e", 
+            f"""
+            const blc = require('broken-link-checker');
+            const fs = require('fs');
+            
+            const results = [];
+            
+            const options = {{
+                excludeExternalLinks: false,
+                excludeInternalLinks: false,
+                excludeLinksToSamePage: true,
+                honorRobotExclusions: true,
+                filterLevel: 0,
+                maxSocketsPerHost: 5,
+                requestMethod: "GET",
+                userAgent: "Mozilla/5.0 (compatible; BrokenLinkChecker/0.1)"
+            }};
+            
+            const siteChecker = new blc.SiteChecker(options, {{
+                link: function(result, customData) {{
+                    const linkInfo = {{
+                        url: result.url.resolved,
+                        status: result.http.response ? result.http.response.statusCode : null,
+                        error: result.broken ? (result.brokenReason || "Unknown error") : null,
+                        is_broken: result.broken
+                    }};
+                    results.push(linkInfo);
+                }},
+                end: function() {{
+                    fs.writeFileSync('{temp_file}', JSON.stringify(results));
+                    process.exit(0);
+                }}
+            }});
+            
+            siteChecker.enqueue('{url}');
+            """
+        ]
+        
+        subprocess.run(cmd, check=True)
+        
+        if temp_file.exists():
+            with open(temp_file, 'r') as f:
+                results_data = json.load(f)
+            
+            link_results = [
+                LinkResult(
+                    url=item['url'],
+                    status=item['status'],
+                    error=item['error'],
+                    is_broken=item['is_broken']
+                )
+                for item in results_data
+            ]
+            
+            temp_file.unlink()
+            
+            return link_results
+        else:
+            return []
+            
+    except subprocess.CalledProcessError as e:
+        print(f"Error running broken-link-checker: {e}")
+        return []
     except Exception as e:
-        return LinkResult(
-            url=link,
-            status=None,
-            error=f"Unexpected error: {str(e)}",
-            is_broken=True
-        )
+        print(f"Unexpected error: {e}")
+        return []
 
 @app.post("/check-links")
 async def check_links(url_request: UrlRequest):
-    """Check all links on a webpage."""
+    """Check all links on a webpage using broken-link-checker."""
     url = str(url_request.url)
     
     try:
-        response = requests.get(url, timeout=30)
+        response = requests.head(url, timeout=10)
         response.raise_for_status()
         
-        links = extract_links(url, response.text)
+        results = run_broken_link_checker(url)
         
-        if not links:
+        if not results:
             return {"message": "No links found on the page", "results": []}
-        
-        async with aiohttp.ClientSession() as session:
-            tasks = [check_link(session, link) for link in links]
-            results = await asyncio.gather(*tasks)
         
         return {
             "message": f"Found {len(results)} links on the page",
@@ -133,17 +141,13 @@ async def export_csv(url_request: UrlRequest):
     url = str(url_request.url)
     
     try:
-        response = requests.get(url, timeout=30)
+        response = requests.head(url, timeout=10)
         response.raise_for_status()
         
-        links = extract_links(url, response.text)
+        results = run_broken_link_checker(url)
         
-        if not links:
+        if not results:
             raise HTTPException(status_code=404, detail="No links found on the page")
-        
-        async with aiohttp.ClientSession() as session:
-            tasks = [check_link(session, link) for link in links]
-            results = await asyncio.gather(*tasks)
         
         output = io.StringIO()
         writer = csv.writer(output)
