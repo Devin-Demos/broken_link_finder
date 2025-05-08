@@ -40,77 +40,134 @@ async def healthz():
     return {"status": "ok"}
 
 def run_broken_link_checker(url: str) -> List[LinkResult]:
-    """Use broken-link-checker to check all links on a webpage."""
+    """Use requests and BeautifulSoup to check links on a webpage as a fallback when Node.js is not available."""
     try:
-        temp_file = Path(__file__).parent.parent / "link_results.json"
-        
-        cmd = [
-            "node", 
-            "-e", 
-            f"""
-            const blc = require('broken-link-checker');
-            const fs = require('fs');
+        try:
+            temp_file = Path(__file__).parent.parent / "link_results.json"
             
-            const results = [];
-            
-            const options = {{
-                excludeExternalLinks: false,
-                excludeInternalLinks: false,
-                excludeLinksToSamePage: true,
-                honorRobotExclusions: true,
-                filterLevel: 0,
-                maxSocketsPerHost: 5,
-                requestMethod: "GET",
-                userAgent: "Mozilla/5.0 (compatible; BrokenLinkChecker/0.1)"
-            }};
-            
-            const siteChecker = new blc.SiteChecker(options, {{
-                link: function(result, customData) {{
-                    const linkInfo = {{
-                        url: result.url.resolved,
-                        status: result.http.response ? result.http.response.statusCode : null,
-                        error: result.broken ? (result.brokenReason || "Unknown error") : null,
-                        is_broken: result.broken
-                    }};
-                    results.push(linkInfo);
-                }},
-                end: function() {{
-                    fs.writeFileSync('{temp_file}', JSON.stringify(results));
-                    process.exit(0);
-                }}
-            }});
-            
-            siteChecker.enqueue('{url}');
-            """
-        ]
-        
-        subprocess.run(cmd, check=True)
-        
-        if temp_file.exists():
-            with open(temp_file, 'r') as f:
-                results_data = json.load(f)
-            
-            link_results = [
-                LinkResult(
-                    url=item['url'],
-                    status=item['status'],
-                    error=item['error'],
-                    is_broken=item['is_broken']
-                )
-                for item in results_data
+            cmd = [
+                "node", 
+                "-e", 
+                f"""
+                const blc = require('broken-link-checker');
+                const fs = require('fs');
+                
+                const results = [];
+                
+                const options = {{
+                    excludeExternalLinks: false,
+                    excludeInternalLinks: false,
+                    excludeLinksToSamePage: true,
+                    honorRobotExclusions: true,
+                    filterLevel: 0,
+                    maxSocketsPerHost: 5,
+                    requestMethod: "GET",
+                    userAgent: "Mozilla/5.0 (compatible; BrokenLinkChecker/0.1)"
+                }};
+                
+                const siteChecker = new blc.SiteChecker(options, {{
+                    link: function(result, customData) {{
+                        const linkInfo = {{
+                            url: result.url.resolved,
+                            status: result.http.response ? result.http.response.statusCode : null,
+                            error: result.broken ? (result.brokenReason || "Unknown error") : null,
+                            is_broken: result.broken
+                        }};
+                        results.push(linkInfo);
+                    }},
+                    end: function() {{
+                        fs.writeFileSync('{temp_file}', JSON.stringify(results));
+                        process.exit(0);
+                    }}
+                }});
+                
+                siteChecker.enqueue('{url}');
+                """
             ]
             
-            temp_file.unlink()
+            process = subprocess.run(cmd, check=True, timeout=10)
             
-            return link_results
-        else:
-            return []
+            if temp_file.exists():
+                with open(temp_file, 'r') as f:
+                    results_data = json.load(f)
+                
+                link_results = [
+                    LinkResult(
+                        url=item['url'],
+                        status=item['status'],
+                        error=item['error'],
+                        is_broken=item['is_broken']
+                    )
+                    for item in results_data
+                ]
+                
+                temp_file.unlink()
+                
+                return link_results
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+            print(f"Node.js broken-link-checker not available, using fallback: {e}")
+        
+        from bs4 import BeautifulSoup
+        import asyncio
+        import aiohttp
+        
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        html_content = response.text
+        
+        soup = BeautifulSoup(html_content, 'html.parser')
+        base_url = url
+        
+        links = []
+        for a_tag in soup.find_all('a', href=True):
+            href = a_tag['href']
+            if href.startswith('#') or href == '':
+                continue
+                
+            if not href.startswith(('http://', 'https://')):
+                if href.startswith('/'):
+                    parsed_url = requests.utils.urlparse(base_url)
+                    href = f"{parsed_url.scheme}://{parsed_url.netloc}{href}"
+                else:
+                    if not base_url.endswith('/'):
+                        base_url = base_url + '/'
+                    href = requests.compat.urljoin(base_url, href)
             
-    except subprocess.CalledProcessError as e:
-        print(f"Error running broken-link-checker: {e}")
-        return []
+            links.append(href)
+        
+        links = list(set(links))
+        
+        async def check_links_async(links):
+            async def check_link(session, link):
+                try:
+                    async with session.head(link, timeout=10, allow_redirects=True) as response:
+                        return LinkResult(
+                            url=link,
+                            status=response.status,
+                            error=None,
+                            is_broken=response.status >= 400
+                        )
+                except Exception as e:
+                    return LinkResult(
+                        url=link,
+                        status=None,
+                        error=str(e),
+                        is_broken=True
+                    )
+            
+            async with aiohttp.ClientSession() as session:
+                tasks = [check_link(session, link) for link in links]
+                return await asyncio.gather(*tasks)
+        
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        results = loop.run_until_complete(check_links_async(links))
+        loop.close()
+        
+        return results
+            
     except Exception as e:
-        print(f"Unexpected error: {e}")
+        print(f"Error checking links: {e}")
         return []
 
 @app.post("/check-links")
