@@ -39,7 +39,7 @@ class LinkResult(BaseModel):
 async def healthz():
     return {"status": "ok"}
 
-def run_broken_link_checker(url: str) -> List[LinkResult]:
+async def run_broken_link_checker(url: str) -> List[LinkResult]:
     """Use requests and BeautifulSoup to check links on a webpage as a fallback when Node.js is not available."""
     try:
         try:
@@ -137,9 +137,9 @@ def run_broken_link_checker(url: str) -> List[LinkResult]:
         
         links = list(set(links))
         
-        async def check_links_async(links):
-            async def check_link(session, link):
-                try:
+        async def check_link(link):
+            try:
+                async with aiohttp.ClientSession() as session:
                     async with session.head(link, timeout=10, allow_redirects=True) as response:
                         return LinkResult(
                             url=link,
@@ -147,22 +147,16 @@ def run_broken_link_checker(url: str) -> List[LinkResult]:
                             error=None,
                             is_broken=response.status >= 400
                         )
-                except Exception as e:
-                    return LinkResult(
-                        url=link,
-                        status=None,
-                        error=str(e),
-                        is_broken=True
-                    )
-            
-            async with aiohttp.ClientSession() as session:
-                tasks = [check_link(session, link) for link in links]
-                return await asyncio.gather(*tasks)
+            except Exception as e:
+                return LinkResult(
+                    url=link,
+                    status=None,
+                    error=str(e),
+                    is_broken=True
+                )
         
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        results = loop.run_until_complete(check_links_async(links))
-        loop.close()
+        tasks = [check_link(link) for link in links]
+        results = await asyncio.gather(*tasks)
         
         return results
             
@@ -179,7 +173,7 @@ async def check_links(url_request: UrlRequest):
         response = requests.head(url, timeout=10)
         response.raise_for_status()
         
-        results = run_broken_link_checker(url)
+        results = await run_broken_link_checker(url)
         
         if not results:
             return {"message": "No links found on the page", "results": []}
@@ -201,7 +195,7 @@ async def export_csv(url_request: UrlRequest):
         response = requests.head(url, timeout=10)
         response.raise_for_status()
         
-        results = run_broken_link_checker(url)
+        results = await run_broken_link_checker(url)
         
         if not results:
             raise HTTPException(status_code=404, detail="No links found on the page")
