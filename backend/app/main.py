@@ -6,12 +6,15 @@ import requests
 from pydantic import BaseModel, HttpUrl
 import io
 import csv
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 import re
 import sys
-import subprocess
-import json
+import random
+import time
 from pathlib import Path
+from bs4 import BeautifulSoup
+import asyncio
+import aiohttp
 
 sys.path.append(str(Path(__file__).parent.parent))
 
@@ -35,83 +38,42 @@ class LinkResult(BaseModel):
     error: Optional[str] = None
     is_broken: bool
 
+BROWSER_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/123.0.0.0 Safari/537.36",
+]
+
+def get_browser_headers():
+    return {
+        "User-Agent": random.choice(BROWSER_USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
+    }
+
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
 
-async def run_broken_link_checker(url: str) -> List[LinkResult]:
-    """Use requests and BeautifulSoup to check links on a webpage as a fallback when Node.js is not available."""
+async def extract_links_from_url(url: str) -> List[str]:
+    """Extract all links from a webpage with browser-like behavior."""
+    headers = get_browser_headers()
+    
     try:
-        try:
-            temp_file = Path(__file__).parent.parent / "link_results.json"
-            
-            cmd = [
-                "node", 
-                "-e", 
-                f"""
-                const blc = require('broken-link-checker');
-                const fs = require('fs');
-                
-                const results = [];
-                
-                const options = {{
-                    excludeExternalLinks: false,
-                    excludeInternalLinks: false,
-                    excludeLinksToSamePage: true,
-                    honorRobotExclusions: true,
-                    filterLevel: 0,
-                    maxSocketsPerHost: 5,
-                    requestMethod: "GET",
-                    userAgent: "Mozilla/5.0 (compatible; BrokenLinkChecker/0.1)"
-                }};
-                
-                const siteChecker = new blc.SiteChecker(options, {{
-                    link: function(result, customData) {{
-                        const linkInfo = {{
-                            url: result.url.resolved,
-                            status: result.http.response ? result.http.response.statusCode : null,
-                            error: result.broken ? (result.brokenReason || "Unknown error") : null,
-                            is_broken: result.broken
-                        }};
-                        results.push(linkInfo);
-                    }},
-                    end: function() {{
-                        fs.writeFileSync('{temp_file}', JSON.stringify(results));
-                        process.exit(0);
-                    }}
-                }});
-                
-                siteChecker.enqueue('{url}');
-                """
-            ]
-            
-            process = subprocess.run(cmd, check=True, timeout=10)
-            
-            if temp_file.exists():
-                with open(temp_file, 'r') as f:
-                    results_data = json.load(f)
-                
-                link_results = [
-                    LinkResult(
-                        url=item['url'],
-                        status=item['status'],
-                        error=item['error'],
-                        is_broken=item['is_broken']
-                    )
-                    for item in results_data
-                ]
-                
-                temp_file.unlink()
-                
-                return link_results
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
-            print(f"Node.js broken-link-checker not available, using fallback: {e}")
-        
-        from bs4 import BeautifulSoup
-        import asyncio
-        import aiohttp
-        
-        response = requests.get(url, timeout=10)
+        session = requests.Session()
+        response = session.get(url, headers=headers, timeout=15)
         response.raise_for_status()
         html_content = response.text
         
@@ -135,51 +97,113 @@ async def run_broken_link_checker(url: str) -> List[LinkResult]:
             
             links.append(href)
         
-        links = list(set(links))
-        
-        async def check_link(link):
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.head(link, timeout=10, allow_redirects=True) as response:
-                        return LinkResult(
-                            url=link,
-                            status=response.status,
-                            error=None,
-                            is_broken=response.status >= 400
-                        )
-            except Exception as e:
+        return list(set(links))
+            
+    except Exception as e:
+        print(f"Error extracting links: {e}")
+        return []
+
+async def check_link_with_retry(url: str, max_retries: int = 2) -> LinkResult:
+    """Check if a link is valid with multiple retries and browser-like behavior."""
+    for attempt in range(max_retries):
+        try:
+            headers = get_browser_headers()
+            
+            async with aiohttp.ClientSession(headers=headers) as session:
+                try:
+                    async with session.head(url, timeout=10, allow_redirects=True) as response:
+                        if response.status != 405:
+                            return LinkResult(
+                                url=url,
+                                status=response.status,
+                                error=None,
+                                is_broken=response.status >= 400
+                            )
+                except Exception:
+                    pass
+                
+                async with session.get(url, timeout=15, allow_redirects=True) as response:
+                    return LinkResult(
+                        url=url,
+                        status=response.status,
+                        error=None,
+                        is_broken=response.status >= 400
+                    )
+                    
+        except aiohttp.ClientError as e:
+            if attempt == max_retries - 1:  # Last attempt
                 return LinkResult(
-                    url=link,
+                    url=url,
+                    status=None,
+                    error=f"Connection error: {str(e)}",
+                    is_broken=True
+                )
+        except asyncio.TimeoutError:
+            if attempt == max_retries - 1:  # Last attempt
+                return LinkResult(
+                    url=url,
+                    status=None,
+                    error="Timeout error",
+                    is_broken=True
+                )
+        except Exception as e:
+            if attempt == max_retries - 1:  # Last attempt
+                return LinkResult(
+                    url=url,
                     status=None,
                     error=str(e),
                     is_broken=True
                 )
         
-        tasks = [check_link(link) for link in links]
+        if attempt < max_retries - 1:
+            await asyncio.sleep(1 * (2 ** attempt))
+    
+    return LinkResult(
+        url=url,
+        status=None,
+        error="Unknown error",
+        is_broken=True
+    )
+
+async def check_links_with_browser_behavior(url: str) -> Tuple[str, List[LinkResult]]:
+    """Check all links on a webpage with browser-like behavior."""
+    try:
+        links = await extract_links_from_url(url)
+        
+        if not links:
+            return "No links found on the page", []
+        
+        tasks = [check_link_with_retry(link) for link in links]
+        
+        semaphore = asyncio.Semaphore(10)
+        
+        async def bounded_check(link):
+            async with semaphore:
+                return await check_link_with_retry(link)
+        
+        tasks = [bounded_check(link) for link in links]
         results = await asyncio.gather(*tasks)
         
-        return results
+        return f"Found {len(results)} links on the page", results
             
     except Exception as e:
         print(f"Error checking links: {e}")
-        return []
+        return f"Error checking links: {str(e)}", []
 
 @app.post("/check-links")
 async def check_links(url_request: UrlRequest):
-    """Check all links on a webpage using broken-link-checker."""
+    """Check all links on a webpage with browser-like behavior."""
     url = str(url_request.url)
     
     try:
-        response = requests.head(url, timeout=10)
+        headers = get_browser_headers()
+        response = requests.head(url, headers=headers, timeout=10)
         response.raise_for_status()
         
-        results = await run_broken_link_checker(url)
-        
-        if not results:
-            return {"message": "No links found on the page", "results": []}
+        message, results = await check_links_with_browser_behavior(url)
         
         return {
-            "message": f"Found {len(results)} links on the page",
+            "message": message,
             "results": [result.dict() for result in results]
         }
         
@@ -192,10 +216,11 @@ async def export_csv(url_request: UrlRequest):
     url = str(url_request.url)
     
     try:
-        response = requests.head(url, timeout=10)
+        headers = get_browser_headers()
+        response = requests.head(url, headers=headers, timeout=10)
         response.raise_for_status()
         
-        results = await run_broken_link_checker(url)
+        message, results = await check_links_with_browser_behavior(url)
         
         if not results:
             raise HTTPException(status_code=404, detail="No links found on the page")
